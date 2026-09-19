@@ -1,0 +1,10 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <file>ui/styles.qss</file>
+        <file>ui/icons/model.svg</file>
+        <file>ui/icons/download.svg</file>
+        <file>ui/icons/delete.svg</file>
+        <file>ui/icons/refresh.svg</file>
+    </qresource>
+</RCC>

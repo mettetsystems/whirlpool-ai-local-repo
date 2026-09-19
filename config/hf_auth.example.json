@@ -1,0 +1,8 @@
+{
+  "model_storage_path": "./models",
+  "training_output_path": "./training_output",
+  "inference_output_path": "./inference_output",
+  "image_export_path": "./inference_images",
+  "inference_image": "whirlpool/inference-server:latest",
+  "export_inference_image": false
+}

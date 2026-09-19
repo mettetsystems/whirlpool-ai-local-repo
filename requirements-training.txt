@@ -1,0 +1,4 @@
+-r requirements-runtime.txt
+datasets>=3.5,<5
+peft>=0.15,<1
+bitsandbytes>=0.45,<1

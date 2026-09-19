@@ -1,0 +1,7 @@
+**
+!docker/
+!docker/Dockerfile
+!requirements-runtime.txt
+!src/
+!src/inference/
+!src/inference/runtime.py

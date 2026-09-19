@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  inference-server:
+    image: ${INFERENCE_IMAGE:-whirlpool/inference-server:latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ${CONTAINER_NAME:-inference-server}
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8000}:8000"
+    environment:
+      - MODEL_ID=${MODEL_ID}
+      - MODEL_PATH=/models
+      - DEVICE=${DEVICE:-auto}
+      - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-1}
+      - MAX_SEQ_LEN=${MAX_SEQ_LEN:-2048}
+      - QUANTIZATION=${QUANTIZATION:-none}
+      - VLLM_ENABLED=${VLLM_ENABLED:-false}
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - GPU_COUNT=${GPU_COUNT:-1}
+    volumes:
+      - ${MODEL_PATH:?Set MODEL_PATH to a downloaded model directory}:/models:ro
+      - ${LOG_DIR:-./logs}:/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: ${GPU_DRIVER:-nvidia}
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  models:
+  logs:

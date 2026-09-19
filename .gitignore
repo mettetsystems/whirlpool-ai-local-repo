@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+models/
+training_output/
+logs/
+docker/generated-inference.json
+config/hf_auth.json
+inference_output/
+inference_images/
