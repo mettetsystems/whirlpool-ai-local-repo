@@ -91,7 +91,7 @@ class ManifestValidator:
             if not root.is_dir():
                 continue
             for file in root.rglob("*"):
-                if not file.is_file() or file.resolve() == self.manifest_path.resolve():
+                if not file.is_file() or file.resolve() == self.manifest_path.resolve() or file.is_relative_to(self.manifest_path.parent / ".downloads"):
                     continue
                 stat = file.stat()
                 identity = (stat.st_dev, stat.st_ino)

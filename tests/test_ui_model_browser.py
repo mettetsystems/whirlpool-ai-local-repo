@@ -255,6 +255,13 @@ class TestDownloadModelDialog:
         with patch.object(hf_client, 'search_models', return_value=mock_results):
             dialog.model_id_input.setText("test")
             dialog._search_models()
+            from PyQt5.QtCore import QEventLoop, QTimer
+            loop = QEventLoop()
+            dialog.search_thread.finished.connect(loop.quit)
+            QTimer.singleShot(3000, loop.quit)
+            loop.exec_()
+            app.processEvents()
+            assert dialog.search_thread is None
 
             assert dialog.search_results.count() == 2
             assert "test-model-1" in dialog.search_results.item(0).text()

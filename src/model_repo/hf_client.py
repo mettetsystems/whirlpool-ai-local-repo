@@ -13,6 +13,8 @@ from huggingface_hub import HfApi, snapshot_download, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError, validate_repo_id
 from src.model_repo.manifest_validator import ManifestValidator, ManifestValidationError
 from src.settings import read_settings, save_settings
+from src.model_repo.download_state import DownloadState
+from src.model_repo.download_process import run_download, DownloadPaused
 
 
 class HuggingFaceClient:
@@ -149,6 +151,8 @@ class HuggingFaceClient:
         self,
         model_id: str,
         local_dir: Optional[str] = None,
+        progress_callback=None,
+        stop_event=None,
         **kwargs
     ) -> Dict[str, Any]:
         """Download a model from HuggingFace Hub.
@@ -171,9 +175,13 @@ class HuggingFaceClient:
             )
 
         validate_repo_id(model_id)
+        state = DownloadState(self._model_storage_path)
+        previous = state.get(model_id)
         existing = self.get_model_info(model_id)
         if local_dir:
             model_local_dir = Path(local_dir).expanduser().resolve()
+        elif previous and previous.get("local_path") and previous.get("status") != "completed":
+            model_local_dir = Path(previous["local_path"]).resolve()
         elif existing and existing.get("managed_files", True):
             model_local_dir = Path(existing["local_path"]).resolve()
         else:
@@ -186,7 +194,8 @@ class HuggingFaceClient:
                 other.is_relative_to(model_local_dir) or model_local_dir.is_relative_to(other)
             ):
                 raise ValueError("Download destination overlaps another model. Choose a new directory.")
-        if model_local_dir.exists() and any(model_local_dir.iterdir()) and (
+        resumable = previous and previous.get("revision") and Path(previous["local_path"]).resolve() == model_local_dir
+        if model_local_dir.exists() and any(model_local_dir.iterdir()) and not resumable and (
             not existing or Path(existing["local_path"]).resolve() != model_local_dir
             or not existing.get("managed_files", True)
         ):
@@ -194,33 +203,76 @@ class HuggingFaceClient:
 
         # Require Hub file metadata rather than guessing model size. Pin the revision
         # so the downloaded snapshot has the same contents as the quota estimate.
-        info = self.api.model_info(model_id, token=self._token, files_metadata=True,
-                                   revision=kwargs.get("revision"))
+        revision = previous["revision"] if resumable and previous.get("status") != "completed" else kwargs.get("revision")
+        if resumable and kwargs.get("revision") and kwargs["revision"] != revision:
+            raise ValueError("Finish or remove the pending download before changing its revision")
+        info = self.api.model_info(model_id, token=self._token, files_metadata=True, revision=revision)
         if not info.siblings or any(type(file.size) is not int or file.size < 0 for file in info.siblings):
             raise ManifestValidationError("Cannot determine model size; download was not started")
         if not isinstance(info.sha, str) or not info.sha:
             raise ManifestValidationError("Cannot resolve model revision; download was not started")
-        allowed, reason = ManifestValidator(str(self._manifest_path)).check_quota_available(
-            sum(file.size for file in info.siblings))
+        total = sum(file.size for file in info.siblings)
+        completed = 0
+        if resumable and previous["revision"] == info.sha:
+            for file in info.siblings:
+                name = getattr(file, 'rfilename', None)
+                if isinstance(name, str):
+                    path = (model_local_dir / name).resolve()
+                    if path.is_relative_to(model_local_dir) and path.is_file() and path.stat().st_size == file.size:
+                        completed += file.size
+        # Existing partial chunks already count in storage usage; reserve only
+        # remaining snapshot bytes on a pinned resume.
+        retained = completed
+        if resumable and previous["revision"] == info.sha:
+            cache = model_local_dir / '.cache' / 'huggingface' / 'download'
+            retained += sum(path.stat().st_size for path in cache.rglob('*.incomplete') if path.is_file())
+        allowed, reason = ManifestValidator(str(self._manifest_path)).check_quota_available(max(0, total - min(total, retained)))
         if not allowed:
             raise ManifestValidationError(reason)
         kwargs["revision"] = info.sha
         model_local_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download the model
+        record = {"model_id":model_id, "local_path":str(model_local_dir), "revision":info.sha,
+                  "status":"downloading", "bytes":completed, "total":total, "error":""}
+        state.save(record)
+        last_save = [0.0]
+        def report(event):
+            import time
+            record.update(bytes=event['bytes'], total=event['total'])
+            if time.monotonic() - last_save[0] > 1:
+                state.save(record)
+                last_save[0] = time.monotonic()
+            progress_callback(event)
         try:
-            downloaded_files = snapshot_download(
-                repo_id=model_id,
-                local_dir=str(model_local_dir),
-                token=self._token,
-                **kwargs
-            )
-        except RepositoryNotFoundError:
-            raise RepositoryNotFoundError(
-                f"Model '{model_id}' not found on HuggingFace Hub."
-            )
-        except HfHubHTTPError as e:
-            raise HfHubHTTPError(f"Failed to download model: {str(e)}")
+            if progress_callback is not None or stop_event is not None:
+                if progress_callback is None:
+                    progress_callback = lambda event: None
+                options = dict(kwargs)
+                options.pop('revision', None)
+                if options.get('force_download'):
+                    raise ValueError("Force download cannot be combined with resumable UI downloads")
+                downloaded_files = run_download({
+                    'model_id':model_id, 'local_dir':str(model_local_dir), 'revision':info.sha,
+                    'token':self._token, 'total_bytes':total, 'completed_bytes':completed,
+                    'files_total':len(info.siblings), 'options':options,
+                }, report, stop_event)
+            else:
+                downloaded_files = snapshot_download(repo_id=model_id, local_dir=str(model_local_dir),
+                                                     token=self._token, **kwargs)
+        except Exception as exc:
+            persisted = 0
+            for file in info.siblings:
+                name = getattr(file, 'rfilename', None)
+                if isinstance(name, str):
+                    path = (model_local_dir / name).resolve()
+                    if path.is_relative_to(model_local_dir) and path.is_file() and path.stat().st_size == file.size:
+                        persisted += file.size
+            cache = model_local_dir / '.cache' / 'huggingface' / 'download'
+            persisted += sum(path.stat().st_size for path in cache.rglob('*.incomplete') if path.is_file())
+            record.update(bytes=min(total, persisted), status='paused' if isinstance(exc, DownloadPaused) else 'failed',
+                          error=str(exc).replace(self._token, '[redacted]'))
+            state.save(record)
+            raise
 
         # Get model info
         try:
@@ -246,6 +298,8 @@ class HuggingFaceClient:
 
         # Update manifest
         self._update_manifest(model_id, metadata)
+        record.update(status="completed", bytes=total, error="")
+        state.save(record)
 
         return metadata
 

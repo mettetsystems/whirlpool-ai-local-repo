@@ -40,8 +40,8 @@ An alternate config can be supplied with:
 Paste `organization/model` into Download Model and click Download. Downloaded
 models appear in the list with their local paths. Selecting a model expands its
 metadata and displays its saved README, without a network request. Download,
-container build, and training run in background threads; closing is deferred
-while one of these operations is active. Hub search still runs synchronously.
+container build, training, and Hub search run in background threads; closing is deferred
+while an operation is active. Pause downloads before closing the app.
 
 Already have a model on disk? Click **Add Local Model** and select its source
 directory (the folder containing `config.json` or a GGUF file). The app registers
@@ -50,6 +50,39 @@ model list. Removing an added local model from the list preserves its source
 files. GGUF folders can be catalogued, but the bundled Transformers runtime does
 not run GGUF models.
 
+## Download progress, resume, and batches
+
+- **Download Model** searches Hugging Face asynchronously. Click a result once to
+  select that exact model, then **Download Selected Model**. You can also paste
+  an exact ID directly. Searching never downloads all results.
+- **Batch Download** is a separate toolbar button. Check individual results,
+  optionally search again to add more, then click **Download Checked Models**.
+  Checks persist across searches; Clear batch selection resets them. You can
+  also add exact IDs directly. Each batch allows up to 10 unique models and runs
+  sequentially; failures do not prevent the other checked models from downloading.
+- The **Downloads** tab shows each model's status, percentage, received bytes,
+  transfer rate, ETA, current file, and file counts. Rates are averages for the
+  current transfer process; cached data can make progress jump forward. Errors
+  appear on the affected row (hover for the full message).
+- **Pause downloads** stops the current transfer and leaves remaining models
+  queued. Select paused/failed/queued rows and click **Resume Selected**. Hold
+  Ctrl/Shift to select several rows. Pause can wait for metadata requests to
+  finish; transfer workers are stopped once that phase completes.
+- Download records survive restarts. An unexpected exit appears as interrupted
+  and can be resumed. The revision is pinned, completed files are reused, and
+  Hugging Face resumes cached chunks when the transfer backend supports it.
+  Received bytes not yet flushed to disk may need to be transferred again.
+
+State lives under the selected model directory's `.downloads/` folder and contains
+no credentials. Keep the downloaded folder and its `.cache/huggingface` contents
+for resume to work. Tokens reach disposable transfer workers over stdin, never
+through command-line arguments or state files. Unknown partial directories from
+older app versions remain protected from automatic overwrite.
+
+The byte-progress adapter is tested against `huggingface_hub` 0.36.x, which is
+pinned in `requirements.txt`. After upgrading, install dependencies with
+`.venv/bin/python -m pip install -r requirements.txt`.
+
 ## Model storage quota
 
 The download quota is **1 TiB (1,099,511,627,776 bytes)**. Before a download, the
@@ -57,7 +90,7 @@ client reads file sizes from Hugging Face, resolves the revision, and rejects a
 snapshot that would exceed the quota. Missing size metadata fails explicitly.
 Downloads are pinned to the checked revision. Partial downloads and registered
 external model files count toward usage; overlapping registrations are counted
-once. A retry conservatively reserves the full snapshot size again.
+once. A pinned resume reserves only the remaining snapshot bytes, accounting for completed files and retained partial chunks.
 
 This is an application preflight check, not a filesystem quota: avoid concurrent
 app instances writing to the same repository. External writes and download-cache
@@ -219,3 +252,5 @@ model replaces the configured service.
 API references used for the training repair:
 [Transformers Trainer](https://huggingface.co/docs/transformers/main_classes/trainer)
 and [PEFT model parameter counts](https://huggingface.co/docs/peft/package_reference/peft_model).
+
+Model cards use a readable documentation view that hides Hub YAML metadata and badge/image placeholders while preserving headings, tables, and code examples. Use **Show original model card source** to inspect the complete unmodified README.

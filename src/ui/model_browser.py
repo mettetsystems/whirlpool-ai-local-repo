@@ -1,6 +1,7 @@
 """Model Browser UI for displaying and managing local models."""
 
 import json
+from html import escape
 import os
 from datetime import datetime
 from uuid import uuid4
@@ -33,6 +34,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QFileDialog,
     QTabWidget,
+    QAbstractItemView,
 )
 from PyQt5.QtGui import QFont, QColor, QPalette
 
@@ -84,6 +86,9 @@ class ModelInfoThread(QThread):
             self.model_info_fetched.emit(info_dict)
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+
+from src.ui.model_card import ModelCardView
 
 
 class ModelCardWidget(QWidget):
@@ -138,6 +143,8 @@ class ModelCardWidget(QWidget):
         card_layout.addWidget(self.expand_button)
 
         card_layout.addWidget(self.metadata_section)
+        layout.addWidget(self.card_frame)
+        self.metadata_section.hide()
 
         # Populate initial info
         self._update_info_display()
@@ -147,15 +154,15 @@ class ModelCardWidget(QWidget):
         model_info = self.model_data.get("model_info", {})
 
         info_text = f"""
-        <b>Author:</b> {model_info.get('author', 'N/A')}<br>
-        <b>Likes:</b> {model_info.get('likes', 0)}<br>
-        <b>Downloads:</b> {model_info.get('downloads', 0)}<br>
-        <b>Pipeline:</b> {model_info.get('pipeline_tag', 'N/A')}<br>
+        <b>Author:</b> {escape(str(model_info.get('author', 'N/A')))}<br>
+        <b>Likes:</b> {escape(str(model_info.get('likes', 0)))}<br>
+        <b>Downloads:</b> {escape(str(model_info.get('downloads', 0)))}<br>
+        <b>Pipeline:</b> {escape(str(model_info.get('pipeline_tag', 'N/A')))}<br>
         """
 
         tags = model_info.get('tags', [])
         if tags:
-            info_text += f"<b>Tags:</b> {', '.join(tags[:5])}"
+            info_text += f"<b>Tags:</b> {escape(', '.join(str(tag) for tag in tags[:5]))}"
             if len(tags) > 5:
                 info_text += f" (+{len(tags) - 5} more)"
 
@@ -273,6 +280,11 @@ class ModelBrowserWindow(QMainWindow):
         self.settings_tab = SettingsTab(self.hf_client, lambda: self.active_task is not None, self)
         self.settings_tab.saved.connect(self._refresh_model_list)
         self.tabs.addTab(self.settings_tab, "Settings")
+        from src.ui.downloads_tab import DownloadsTab
+        self.downloads_tab = DownloadsTab(self.hf_client, self)
+        self.downloads_tab.resume_requested.connect(self._start_downloads)
+        self.settings_tab.saved.connect(self.downloads_tab.reload)
+        self.tabs.addTab(self.downloads_tab, "Downloads")
 
     def _create_toolbar(self) -> QWidget:
         """Create the toolbar with action buttons."""
@@ -289,6 +301,9 @@ class ModelBrowserWindow(QMainWindow):
         self.download_button = QPushButton("Download Model")
         self.download_button.clicked.connect(self._show_download_dialog)
         layout.addWidget(self.download_button)
+        self.batch_download_button = QPushButton("Batch Download")
+        self.batch_download_button.clicked.connect(self._show_batch_download_dialog)
+        layout.addWidget(self.batch_download_button)
 
         self.local_model_button = QPushButton("Add Local Model")
         self.local_model_button.clicked.connect(self._add_local_model)
@@ -387,9 +402,7 @@ class ModelBrowserWindow(QMainWindow):
         self.model_card._toggle_expand()
         card_text = self.hf_client.get_model_card(model_data["model_id"])
         if card_text:
-            published_card = QTextEdit()
-            published_card.setReadOnly(True)
-            published_card.setMarkdown(card_text)
+            published_card = ModelCardView(card_text)
             self.details_layout.addWidget(published_card)
 
     def _on_model_info_fetched(self, info: Dict[str, Any]):
@@ -410,10 +423,44 @@ class ModelBrowserWindow(QMainWindow):
             if model_id:
                 self._download_model(model_id)
 
+    def _show_batch_download_dialog(self):
+        dialog = DownloadModelDialog(self.hf_client, self, batch=True)
+        if dialog.exec_() == QDialog.Accepted:
+            self._start_downloads(dialog.get_model_ids())
+
     def _download_model(self, model_id: str):
-        """Download a model from HuggingFace."""
-        self._run_task("Downloading model", lambda: self.hf_client.download_model(model_id),
-                       lambda result: self._refresh_model_list())
+        self._start_downloads([model_id])
+
+    def _start_downloads(self, model_ids):
+        if self.active_task is not None:
+            QMessageBox.information(self, "Task running", "Wait for the current operation to finish.")
+            return
+        model_ids = list(dict.fromkeys(model_ids))
+        if not model_ids:
+            return
+        if len(model_ids) > 10:
+            QMessageBox.warning(self, "Batch too large", "Select at most 10 models per batch.")
+            return
+        from src.model_repo.download_state import DownloadState
+        from src.ui.downloads_tab import DownloadThread
+        state = DownloadState(self.hf_client._model_storage_path)
+        try:
+            for model_id in model_ids:
+                if not state.get(model_id):
+                    state.save({'model_id':model_id, 'status':'queued'})
+        except OSError as exc:
+            QMessageBox.critical(self, "Cannot save queue", str(exc))
+            return
+        worker = DownloadThread(self.hf_client, model_ids, self)
+        self.active_task = worker
+        self.downloads_tab.begin(worker)
+        worker.model_ready.connect(lambda metadata: self._refresh_model_list())
+        def finished():
+            self.active_task = None
+            worker.deleteLater()
+        worker.finished.connect(finished)
+        self.tabs.setCurrentWidget(self.downloads_tab)
+        worker.start()
 
     def _run_task(self, title, operation, on_success=None):
         if self.active_task is not None:
@@ -598,86 +645,150 @@ class ModelBrowserWindow(QMainWindow):
 
 
 class DownloadModelDialog(QDialog):
-    """Dialog for downloading a new model from HuggingFace."""
+    """Search and explicitly choose one model, or check models for a batch."""
 
-    def __init__(self, hf_client: HuggingFaceClient, parent=None):
+    def __init__(self, hf_client, parent=None, batch=False):
         super().__init__(parent)
         self.hf_client = hf_client
-        self._setup_ui()
-
-    def _setup_ui(self):
-        """Set up the download dialog UI."""
-        self.setWindowTitle("Download Model")
-        self.setMinimumSize(400, 200)
-
+        self.batch = batch
+        self.checked = {}
+        self.search_thread = None
+        self.searched = False
+        self.setWindowTitle("Batch Download" if batch else "Download Model")
+        self.setMinimumSize(600, 400)
         layout = QVBoxLayout(self)
-
-        # Model ID input
-        model_id_label = QLabel("Model ID (e.g., meta-llama/Llama-2-7b):")
-        layout.addWidget(model_id_label)
-
+        layout.addWidget(QLabel("Search Hugging Face or paste an exact model ID"))
         self.model_id_input = QLineEdit()
-        self.model_id_input.setPlaceholderText("Enter HuggingFace model ID")
+        self.model_id_input.setPlaceholderText("organization/model or search terms")
         layout.addWidget(self.model_id_input)
-
-        # Search button
         self.search_button = QPushButton("Search")
         self.search_button.clicked.connect(self._search_models)
         layout.addWidget(self.search_button)
-
-        # Search results list
         self.search_results = QListWidget()
+        self.search_results.itemClicked.connect(self._select_search_result)
         self.search_results.itemDoubleClicked.connect(self._select_search_result)
+        self.search_results.itemChanged.connect(self._checked_changed)
+        self.search_results.itemSelectionChanged.connect(self._selection_changed)
         layout.addWidget(self.search_results)
-
-        # Buttons
-        button_layout = QHBoxLayout()
-
-        self.download_button = QPushButton("Download")
-        self.download_button.clicked.connect(self.accept)
+        self.selection_label = QLabel("Check up to 10 models; choices are kept across searches." if batch else "Select a result to download it.")
+        self.selection_label.setWordWrap(True)
+        layout.addWidget(self.selection_label)
+        if batch:
+            add = QPushButton("Add entered model ID to batch")
+            add.clicked.connect(self._add_entered)
+            layout.addWidget(add)
+            clear = QPushButton("Clear batch selection")
+            clear.clicked.connect(self._clear_checked)
+            layout.addWidget(clear)
+        row = QHBoxLayout()
+        self.download_button = QPushButton("Download Checked Models" if batch else "Download Selected Model")
         self.download_button.setEnabled(False)
-        self.model_id_input.textChanged.connect(
-            lambda text: self.download_button.setEnabled(bool(text.strip())))
-        button_layout.addWidget(self.download_button)
+        self.download_button.clicked.connect(self.accept)
+        self.model_id_input.textChanged.connect(self._input_changed)
+        row.addWidget(self.download_button)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        layout.addLayout(row)
 
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_button)
+    def _input_changed(self, text):
+        if not self.batch:
+            self.download_button.setEnabled(bool(text.strip()) and (not self.searched or '/' in text))
 
-        layout.addLayout(button_layout)
-
-    def get_model_id(self) -> Optional[str]:
-        """Get the selected model ID."""
+    def get_model_id(self):
         return self.model_id_input.text().strip()
 
+    def get_model_ids(self):
+        return list(self.checked) if self.batch else [self.get_model_id()]
+
     def _search_models(self):
-        """Search for models on HuggingFace."""
         query = self.model_id_input.text().strip()
-        if not query:
+        if not query or self.search_thread is not None:
             return
-
+        self.searched = True
         self.search_results.clear()
+        if not self.batch:
+            self.download_button.setEnabled(False)
+        self.search_button.setEnabled(False)
+        self.selection_label.setText("Searching…")
+        task = TaskThread(lambda: self.hf_client.search_models(query, limit=30), self)
+        self.search_thread = task
+        task.succeeded.connect(self._search_ready)
+        task.failed.connect(lambda error: self.selection_label.setText("Search failed: " + error))
+        def finished():
+            self.search_thread = None
+            self.search_button.setEnabled(True)
+            task.deleteLater()
+        task.finished.connect(finished)
+        task.start()
 
-        try:
-            results = self.hf_client.search_models(query, limit=10)
-            for result in results:
-                item_text = f"{result['id']} - {result.get('author', 'Unknown')} ({result.get('likes', 0)} likes)"
-                item = QListWidgetItem(item_text)
-                item.setData(Qt.UserRole, result)
-                self.search_results.addItem(item)
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Search Failed",
-                f"Failed to search models: {str(e)}"
-            )
+    def _search_ready(self, results):
+        self.search_results.blockSignals(True)
+        for result in results:
+            item = QListWidgetItem(f"{result['id']} — {result.get('downloads', 0)} downloads")
+            item.setData(Qt.UserRole, result)
+            if self.batch:
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if result['id'] in self.checked else Qt.Unchecked)
+            self.search_results.addItem(item)
+        self.search_results.blockSignals(False)
+        if self.batch:
+            self._update_checked()
+        else:
+            self.selection_label.setText("Select one result to download." if results else "No models found.")
 
-    def _select_search_result(self, item: QListWidgetItem):
-        """Handle search result selection."""
+    def _selection_changed(self):
+        if not self.batch and self.search_results.currentItem():
+            self._select_search_result(self.search_results.currentItem())
+
+    def _select_search_result(self, item):
+        if self.batch:
+            return
         result = item.data(Qt.UserRole)
         if result:
-            self.model_id_input.setText(result.get("id", ""))
+            self.model_id_input.setText(result['id'])
             self.download_button.setEnabled(True)
+
+    def _checked_changed(self, item):
+        if not self.batch:
+            return
+        model_id = item.data(Qt.UserRole)['id']
+        if item.checkState() == Qt.Checked:
+            self.checked[model_id] = True
+        else:
+            self.checked.pop(model_id, None)
+        self._update_checked()
+
+    def _update_checked(self):
+        self.selection_label.setText(f"{len(self.checked)}/10 selected: " + ', '.join(self.checked))
+        self.download_button.setEnabled(0 < len(self.checked) <= 10)
+
+    def _add_entered(self):
+        from huggingface_hub.utils import validate_repo_id
+        try:
+            model_id = self.get_model_id()
+            validate_repo_id(model_id)
+        except ValueError as exc:
+            self.selection_label.setText(str(exc))
+            return
+        self.checked[model_id] = True
+        for index in range(self.search_results.count()):
+            item = self.search_results.item(index)
+            if item.data(Qt.UserRole)['id'] == model_id:
+                item.setCheckState(Qt.Checked)
+        self._update_checked()
+
+    def _clear_checked(self):
+        self.checked.clear()
+        for index in range(self.search_results.count()):
+            self.search_results.item(index).setCheckState(Qt.Unchecked)
+        self._update_checked()
+
+    def done(self, result):
+        if self.search_thread is not None:
+            self.selection_label.setText("Wait for the search to finish before closing.")
+            return
+        super().done(result)
 
 
 if __name__ == "__main__":
