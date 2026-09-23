@@ -10,7 +10,8 @@ from typing import Dict, List, Optional, Any
 
 import requests
 from huggingface_hub import HfApi, snapshot_download, hf_hub_download
-from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
+from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError, validate_repo_id
+from src.model_repo.manifest_validator import ManifestValidator, ManifestValidationError
 from src.settings import read_settings, save_settings
 
 
@@ -169,12 +170,41 @@ class HuggingFaceClient:
                 "HuggingFace token not set. Please configure hf_auth.json or call set_token()."
             )
 
-        # Determine local directory
+        validate_repo_id(model_id)
+        existing = self.get_model_info(model_id)
         if local_dir:
-            model_local_dir = Path(local_dir)
+            model_local_dir = Path(local_dir).expanduser().resolve()
+        elif existing and existing.get("managed_files", True):
+            model_local_dir = Path(existing["local_path"]).resolve()
         else:
-            model_local_dir = self._model_storage_path / model_id.replace("/", "_")
+            # Hash the full ID: replacing slashes with underscores is not injective.
+            digest = hashlib.sha256(model_id.encode()).hexdigest()
+            model_local_dir = self._model_storage_path / digest
+        for entry in self.list_models():
+            other = Path(entry["local_path"]).resolve()
+            if entry["model_id"] != model_id and (
+                other.is_relative_to(model_local_dir) or model_local_dir.is_relative_to(other)
+            ):
+                raise ValueError("Download destination overlaps another model. Choose a new directory.")
+        if model_local_dir.exists() and any(model_local_dir.iterdir()) and (
+            not existing or Path(existing["local_path"]).resolve() != model_local_dir
+            or not existing.get("managed_files", True)
+        ):
+            raise ValueError("Download destination must be empty or owned by this downloaded model")
 
+        # Require Hub file metadata rather than guessing model size. Pin the revision
+        # so the downloaded snapshot has the same contents as the quota estimate.
+        info = self.api.model_info(model_id, token=self._token, files_metadata=True,
+                                   revision=kwargs.get("revision"))
+        if not info.siblings or any(type(file.size) is not int or file.size < 0 for file in info.siblings):
+            raise ManifestValidationError("Cannot determine model size; download was not started")
+        if not isinstance(info.sha, str) or not info.sha:
+            raise ManifestValidationError("Cannot resolve model revision; download was not started")
+        allowed, reason = ManifestValidator(str(self._manifest_path)).check_quota_available(
+            sum(file.size for file in info.siblings))
+        if not allowed:
+            raise ManifestValidationError(reason)
+        kwargs["revision"] = info.sha
         model_local_dir.mkdir(parents=True, exist_ok=True)
 
         # Download the model
@@ -194,7 +224,7 @@ class HuggingFaceClient:
 
         # Get model info
         try:
-            model_info = self.api.model_info(model_id, token=self._token)
+            model_info = info
             model_info_dict = {
                 "id": model_info.id,
                 "author": model_info.author,
@@ -260,7 +290,15 @@ class HuggingFaceClient:
 
         # Remove local directory
         local_path = Path(model_info["local_path"]) if isinstance(model_info["local_path"], str) else model_info["local_path"]
-        if model_info.get("managed_files", True) and local_path.exists():
+        # Old versions could register multiple IDs against one directory. Never
+        # recursively delete a directory overlapping another registration.
+        shared = any(
+            entry["model_id"] != model_id and (
+                Path(entry["local_path"]).resolve().is_relative_to(local_path.resolve())
+                or local_path.resolve().is_relative_to(Path(entry["local_path"]).resolve())
+            ) for entry in self.list_models()
+        )
+        if model_info.get("managed_files", True) and not shared and local_path.exists():
             shutil.rmtree(local_path)
 
         # Update manifest

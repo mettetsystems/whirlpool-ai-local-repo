@@ -236,7 +236,7 @@ class OCIParser(DataParser):
             # List objects in bucket
             list_objects_response = oci.pagination.list_call_get_all_results(
                 object_storage.list_objects,
-                namespace=namespace,
+                namespace_name=namespace,
                 bucket_name=source_config.oci_bucket,
                 prefix=source_config.oci_prefix or ""
             )
@@ -248,13 +248,15 @@ class OCIParser(DataParser):
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
                     download_response = object_storage.get_object(
-                        namespace=namespace,
+                        namespace_name=namespace,
                         bucket_name=source_config.oci_bucket,
                         object_name=obj.name
                     )
 
                     with open(str(dest_path), "wb") as f:
-                        f.write(download_response.data.read())
+                        for chunk in download_response.data.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
 
                     stats["files_processed"] += 1
                     stats["total_size_bytes"] += obj.size

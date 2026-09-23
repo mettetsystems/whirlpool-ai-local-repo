@@ -81,7 +81,7 @@ class TrainingConfig:
     # System settings
     local_files_only: bool = True
     gpu_ids: Optional[List[int]] = None
-    max_storage_gb: float = 10000.0  # 10 TB default
+    max_storage_gb: float = 1024.0  # 1 TiB; model-download quota is enforced by the repository client
 
 
 class QLoRAPipeline:

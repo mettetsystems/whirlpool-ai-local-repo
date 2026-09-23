@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 
 
 @dataclass
@@ -15,6 +15,7 @@ class InferenceConfig:
     """Configuration for inference server deployment."""
     model_id: str
     model_path: str
+    container_runtime: str = "docker"
     host_port: int = 8000
     device: str = "auto"
     max_batch_size: int = 1
@@ -81,7 +82,7 @@ class InferenceServerBuilder:
             "ports": [f"127.0.0.1:{config.host_port}:8000"],
             "environment": {"MODEL_PATH": "/model", "DEVICE": config.device,
                             "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
-            "volumes": [{"type": "bind", "source": str(model_path), "target": "/model", "read_only": True}],
+            "volumes": [{"type": "bind", "source": str(model_path), "target": "/model", "read_only": True, "bind": {"selinux": "z"}}],
             "healthcheck": {"test": ["CMD", "python", "-c",
                 "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"],
                 "interval": "10s", "timeout": "5s", "retries": 30, "start_period": "60s"},
@@ -89,8 +90,11 @@ class InferenceServerBuilder:
             "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
         }
         if config.device != "cpu" and config.gpu_count > 0:
-            service["deploy"] = {"resources": {"reservations": {"devices": [
-                {"driver": config.gpu_driver, "count": config.gpu_count, "capabilities": ["gpu"]}]}}}
+            if config.container_runtime == "podman":
+                service["devices"] = [f"nvidia.com/gpu={index}" for index in range(config.gpu_count)]
+            else:
+                service["deploy"] = {"resources": {"reservations": {"devices": [
+                    {"driver": config.gpu_driver, "count": config.gpu_count, "capabilities": ["gpu"]}]}}}
         # JSON is valid YAML and safely quotes paths and user-provided settings.
         return json.dumps({"services": {"inference-server": service}}, indent=2)
 
@@ -120,7 +124,6 @@ class InferenceServerBuilder:
         Returns:
             Dictionary with build status and output.
         """
-        compose_file = self.save_config(config, output_path)
 
         # Determine which compose tool to use
         compose_cmd = self._get_compose_command()
@@ -131,6 +134,8 @@ class InferenceServerBuilder:
                 "error": "No compose tool found. Please install Docker or Podman with compose support.",
             }
 
+        config = replace(config, container_runtime="podman" if compose_cmd[0].startswith("podman") else "docker")
+        compose_file = self.save_config(config, output_path)
         try:
             result = subprocess.run(
                 compose_cmd + ["-f", str(compose_file), "up", "--build", "-d"],
@@ -167,7 +172,6 @@ class InferenceServerBuilder:
         Returns:
             Dictionary with start status and output.
         """
-        compose_file = self.save_config(config, output_path)
         compose_cmd = self._get_compose_command()
 
         if compose_cmd is None:
@@ -176,6 +180,8 @@ class InferenceServerBuilder:
                 "error": "No compose tool found.",
             }
 
+        config = replace(config, container_runtime="podman" if compose_cmd[0].startswith("podman") else "docker")
+        compose_file = self.save_config(config, output_path)
         try:
             result = subprocess.run(
                 compose_cmd + ["-f", str(compose_file), "up", "-d"],

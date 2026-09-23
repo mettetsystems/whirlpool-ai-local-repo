@@ -4,6 +4,16 @@ A PyQt desktop application for downloading Hugging Face models, browsing their
 local files and published cards, starting a local Transformers inference server,
 and fine-tuning local causal language models with QLoRA.
 
+**Optimized for Fedora 40+, with Fedora 44 as the current development host.**
+The app can run on other operating systems with compatible Python/Qt and a
+container engine; credential integration currently requires Linux Secret Service.
+Other operating systems are not covered by the Fedora verification checks.
+
+Fedora deployments prefer rootless Podman, NVIDIA CDI devices for GPU access,
+and SELinux-labelled read-only model mounts. See [deployment instructions](docs/docker-deployment.md).
+The inference container uses its own Python 3.12 environment, independently of
+the host distribution's Python version.
+
 ## Install and launch
 
 Use Python 3.10+ for the desktop app. Python 3.12 is recommended for the optional
@@ -39,6 +49,22 @@ the existing path without copying or downloading files, then selects it in the
 model list. Removing an added local model from the list preserves its source
 files. GGUF folders can be catalogued, but the bundled Transformers runtime does
 not run GGUF models.
+
+## Model storage quota
+
+The download quota is **1 TiB (1,099,511,627,776 bytes)**. Before a download, the
+client reads file sizes from Hugging Face, resolves the revision, and rejects a
+snapshot that would exceed the quota. Missing size metadata fails explicitly.
+Downloads are pinned to the checked revision. Partial downloads and registered
+external model files count toward usage; overlapping registrations are counted
+once. A retry conservatively reserves the full snapshot size again.
+
+This is an application preflight check, not a filesystem quota: avoid concurrent
+app instances writing to the same repository. External writes and download-cache
+overhead are not constrained by this check. Training outputs are separate.
+New downloads use a hash of the full model ID; existing paths stay unchanged.
+Legacy shared folders cannot be overwritten by re-download, and deleting a
+registration preserves files still referenced by another model.
 
 ## Settings
 
@@ -162,11 +188,28 @@ boundaries use mocks in unit tests. Real model image builds, generation, CUDA
 training, cloud credentials, Docling parsing, and cross-platform installs have
 not been demonstrated in this repair.
 
+## Review fixes verified September 23, 2026
+
+- 236 portable tests passed, including directory collision/deletion protection,
+  quota rejection before download, strict OCI method signatures and streaming,
+  launcher environment handling, and Fedora Podman CDI configuration.
+- Desktop launch smoke test passed.
+- The inference Dockerfile built successfully using rootless Podman as
+  `localhost/whirlpool-inference:review-fixes`.
+- With networking disabled, that image loaded a tiny locally created causal model,
+  served its health endpoint, and completed three real CPU generation requests.
+- Generated Docker and Podman Compose configurations passed schema validation.
+
+GPU execution and real OCI account access were not exercised. The 1 TiB limit is
+validated with scaled fixtures; the quota test now writes only 1 KiB rather than
+allocating/writing 11 GiB. Host/container prerequisite tests are separate from
+the portable test count.
+
 ## Remaining original product scope
 
 This is a repair of the core workflows, not the complete original product.
 Agent/tool/harness construction, video parsing, offline synchronization conflict
-resolution, a 10 TB storage quota, exact 30-day log retention, and alternative
+resolution, exact 30-day log retention, and alternative
 inference engines remain unimplemented. Generated container logs have size-based
 rotation. Training dependencies are optional and version-ranged, not a fully
 locked cross-platform environment. Hardware/model compatibility needs real

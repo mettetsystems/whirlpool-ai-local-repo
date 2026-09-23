@@ -27,7 +27,11 @@ class TestHuggingFaceClient:
     @pytest.fixture
     def client(self, temp_config):
         """Create a HuggingFaceClient instance."""
-        return HuggingFaceClient(auth_config_path=temp_config)
+        client = HuggingFaceClient(auth_config_path=temp_config)
+        client.api.model_info = MagicMock(return_value=MagicMock(
+            id="test/model", author="test", likes=0, downloads=0, tags=[], pipeline_tag=None,
+            sha="a" * 40, siblings=[MagicMock(size=1024)]))
+        return client
 
     def test_init_creates_storage_dir(self, temp_config, tmp_path):
         """Test that initialization creates the storage directory."""

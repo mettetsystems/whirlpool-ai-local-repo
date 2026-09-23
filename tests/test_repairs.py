@@ -62,13 +62,13 @@ def test_oci_namespace_and_pagination(tmp_path):
     sdk.pagination.list_call_get_all_results.return_value.data.objects = [MagicMock(size=5)]
     sdk.pagination.list_call_get_all_results.return_value.data.objects[0].name = "a.txt"
     client = object_storage.ObjectStorageClient.return_value
-    client.get_object.return_value.data.read.return_value = b"hello"
+    client.get_object.return_value.data.iter_content.return_value = [b"he", b"", b"llo"]
     with patch.dict(sys.modules, {"oci": sdk, "oci.object_storage": object_storage}):
         parser = ParserFactory.create_parser("oci")
         parser._client = {"user": "user-is-not-namespace"}
         stats = parser.parse(DataSourceConfig("oci", "", oci_namespace="namespace", oci_bucket="bucket"), tmp_path)
     assert stats["files_processed"] == 1
-    assert sdk.pagination.list_call_get_all_results.call_args.kwargs["namespace"] == "namespace"
+    assert sdk.pagination.list_call_get_all_results.call_args.kwargs["namespace_name"] == "namespace"
     assert (tmp_path / "a.txt").read_bytes() == b"hello"
 
 

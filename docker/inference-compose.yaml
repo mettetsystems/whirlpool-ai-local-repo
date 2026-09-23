@@ -21,17 +21,17 @@ services:
       - TRANSFORMERS_OFFLINE=1
       - GPU_COUNT=${GPU_COUNT:-1}
     volumes:
-      - ${MODEL_PATH:?Set MODEL_PATH to a downloaded model directory}:/models:ro
+      - ${MODEL_PATH:?Set MODEL_PATH to a downloaded model directory}:/models:ro,z
       - ${LOG_DIR:-./logs}:/logs
     deploy:
       resources:
         reservations:
           devices:
             - driver: ${GPU_DRIVER:-nvidia}
-              count: 1
+              count: ${GPU_COUNT:-1}
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -41,3 +41,14 @@ services:
 volumes:
   models:
   logs:
+
+networks:
+  default:
+    name: ${NETWORK_NAME:-whirlpool-network}
+
+# Rootless Podman Notes:
+# - For rootless Podman, use --device flag or CDI for GPU access
+# - NVIDIA CDI: podman run --device=nvidia.com/gpu=all ...
+# - GPU drivers must be available on host and mounted into container
+# - Rootless containers cannot access /dev/nvidia* directly without proper udev rules
+# - Consider using NVIDIA Container Toolkit with rootless mode

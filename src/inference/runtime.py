@@ -45,7 +45,10 @@ def handler_for(generate):
             self.wfile.write(data)
 
         def do_GET(self):
-            self.reply(200, {"status": "ready"}) if self.path == "/health" else self.reply(404, {"error": "Not found"})
+            if self.path in ("/health", "/healthz"):
+                self.reply(200, {"status": "ready"})
+            else:
+                self.reply(404, {"error": "Not found"})
 
         def do_POST(self):
             if self.path != "/generate":
