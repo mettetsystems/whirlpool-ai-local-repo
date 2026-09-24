@@ -263,8 +263,8 @@ class TestDownloadModelDialog:
             app.processEvents()
             assert dialog.search_thread is None
 
-            assert dialog.search_results.count() == 2
-            assert "test-model-1" in dialog.search_results.item(0).text()
+            assert dialog.search_results.topLevelItemCount() == 2
+            assert "test-model-1" in dialog.search_results.topLevelItem(0).text(0)
 
     def test_select_search_result(self, hf_client, app):
         """Test selecting a search result."""
@@ -277,9 +277,10 @@ class TestDownloadModelDialog:
         }
 
         # Create QListWidgetItem explicitly
-        item = QListWidgetItem("selected-model")
-        item.setData(Qt.UserRole, mock_result)
-        dialog.search_results.addItem(item)
+        from PyQt5.QtWidgets import QTreeWidgetItem
+        item = QTreeWidgetItem(["selected-model"])
+        item.setData(0, Qt.UserRole, mock_result)
+        dialog.search_results.addTopLevelItem(item)
 
         dialog._select_search_result(item)
 

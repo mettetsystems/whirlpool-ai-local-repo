@@ -303,6 +303,30 @@ class HuggingFaceClient:
 
         return metadata
 
+    def cleanup_download(self, model_id):
+        """Remove a stopped transfer's owned files, or clear completed history.
+
+        The caller must ensure the download worker has finished first. Custom
+        directories and registered models are never deleted by this operation.
+        """
+        import shutil
+        state = DownloadState(self._model_storage_path)
+        record = state.get(model_id)
+        if not record:
+            return
+        if record.get('status') != 'completed' and record.get('local_path'):
+            destination = Path(record['local_path'])
+            expected = self._model_storage_path / hashlib.sha256(model_id.encode()).hexdigest()
+            registered = [Path(model['local_path']).resolve() for model in self.list_models()]
+            resolved = destination.resolve()
+            if any(path.is_relative_to(resolved) or resolved.is_relative_to(path) for path in registered):
+                raise ValueError('These files belong to a registered model. Manage them from Models.')
+            if destination.is_symlink() or destination.absolute() != expected.absolute() or resolved != expected.absolute():
+                raise ValueError('Cleanup only removes app-owned download folders. This custom location must be managed manually.')
+            if destination.exists():
+                shutil.rmtree(destination)
+        state.path(model_id).unlink(missing_ok=True)
+
     def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
         """Get information about a locally stored model.
 
@@ -368,6 +392,7 @@ class HuggingFaceClient:
         self,
         query: str,
         limit: int = 10,
+        include_download_size: bool = False,
         **kwargs
     ) -> List[Dict[str, Any]]:
         """Search for models on HuggingFace Hub.
@@ -392,7 +417,7 @@ class HuggingFaceClient:
             **kwargs
         )
 
-        return [
+        results = [
             {
                 "id": model.id,
                 "author": model.author,
@@ -403,6 +428,26 @@ class HuggingFaceClient:
             }
             for model in models
         ]
+
+        if include_download_size:
+            # Metadata only: no model files are downloaded. Keep requests bounded
+            # and run this search from the UI worker rather than the GUI thread.
+            from concurrent.futures import ThreadPoolExecutor
+            def estimate(result):
+                try:
+                    info = self.api.model_info(result["id"], token=self._token,
+                                               files_metadata=True, timeout=10)
+                    files = info.siblings
+                    if not files or any(type(file.size) is not int or file.size < 0 for file in files):
+                        return None
+                    return sum(file.size for file in files)
+                except Exception:
+                    # Gated/offline/missing metadata must not prevent selection.
+                    return None
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for result, size in zip(results, pool.map(estimate, results)):
+                    result["download_size_bytes"] = size
+        return results
 
     def get_model_card(self, model_id: str) -> Optional[str]:
         """Get the model card (README) for a model.

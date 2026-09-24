@@ -1,7 +1,7 @@
 """Queued model transfers, with progress and explicit pause/resume controls."""
 import threading
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QProgressBar, QAbstractItemView
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QProgressBar, QAbstractItemView, QMessageBox
 from src.model_repo.download_state import DownloadState
 from src.model_repo.download_process import DownloadPaused
 
@@ -23,11 +23,23 @@ class DownloadThread(QThread):
         self.client = client
         self.model_ids = list(dict.fromkeys(model_ids))
         self.stop_event = threading.Event()
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+        self.stop_event.set()
 
     def run(self):
         state = DownloadState(self.client._model_storage_path)
         for model_id in self.model_ids:
             if self.stop_event.is_set():
+                if self.cancel_event.is_set():
+                    record = state.get(model_id) or {'model_id': model_id}
+                    if record.get('status') != 'completed':
+                        record.update(status='cancelled', error='Cancelled; partial files retained until cleanup.')
+                        state.save(record)
+                        self.updated.emit(model_id, record)
+                    continue
                 break
             self.updated.emit(model_id, {'status':'downloading'})
             try:
@@ -36,11 +48,13 @@ class DownloadThread(QThread):
                 self.updated.emit(model_id, {**record, 'status':'completed'})
                 self.model_ready.emit(metadata)
             except Exception as exc:
-                status = 'paused' if isinstance(exc, DownloadPaused) else 'failed'
+                status = 'cancelled' if self.cancel_event.is_set() else ('paused' if isinstance(exc, DownloadPaused) else 'failed')
                 error = str(exc)
                 if self.client.get_token():
                     error = error.replace(self.client.get_token(), '[redacted]')
                 record = state.get(model_id) or {'model_id':model_id}
+                if status == 'cancelled':
+                    error = 'Cancelled; partial files retained until cleanup.'
                 record.update(status=status, error=error)
                 state.save(record)
                 self.updated.emit(model_id, record)
@@ -70,6 +84,13 @@ class DownloadsTab(QWidget):
         self.resume_button.clicked.connect(self.resume)
         buttons.addWidget(self.pause_button)
         buttons.addWidget(self.resume_button)
+        self.cancel_button = QPushButton('Cancel downloads')
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel)
+        buttons.addWidget(self.cancel_button)
+        self.cleanup_button = QPushButton('Clean Up Selected')
+        self.cleanup_button.clicked.connect(self.cleanup)
+        buttons.addWidget(self.cleanup_button)
         layout.addLayout(buttons)
         self.summary = QLabel('Ready')
         layout.addWidget(self.summary)
@@ -108,7 +129,7 @@ class DownloadsTab(QWidget):
             bar.setRange(0, 100)
             bar.setValue(100)
             item.setText(6, 'Complete')
-        if event.get('status') in ('completed','failed','paused','interrupted'):
+        if event.get('status') in ('completed','failed','paused','interrupted','cancelled'):
             bar.setRange(0, 100)
             item.setText(4, '')
             item.setText(5, '')
@@ -125,6 +146,8 @@ class DownloadsTab(QWidget):
 
     def begin(self, worker):
         self.worker = worker
+        self.cancel_button.setEnabled(True)
+        self.cleanup_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.resume_button.setEnabled(False)
         self.summary.setText(f'{len(worker.model_ids)} model(s) queued')
@@ -139,15 +162,51 @@ class DownloadsTab(QWidget):
             self.pause_button.setEnabled(False)
             self.summary.setText('Pausing; partial downloads will be kept…')
 
+    def cancel(self):
+        if self.worker:
+            self.worker.cancel()
+            self.pause_button.setEnabled(False)
+            self.cancel_button.setEnabled(False)
+            self.summary.setText('Cancelling the current download and remaining queue…')
+
+    def cleanup(self):
+        if self.worker is not None:
+            self.summary.setText('Wait for downloads to stop before cleaning up.')
+            return
+        selected = [item.data(0, Qt.UserRole) for item in self.tree.selectedItems()]
+        if not selected:
+            self.summary.setText('Select downloads to clean up first.')
+            return
+        reply = QMessageBox.question(self, 'Clean up selected downloads',
+            'Delete partial files for selected unfinished downloads and remove their history? '
+            'Completed entries will only be removed from download history; installed models are kept.\n\n'
+            + '\n'.join(selected), QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        errors = []
+        removed = 0
+        for model_id in selected:
+            try:
+                self.client.cleanup_download(model_id)
+                removed += 1
+            except (OSError, ValueError) as exc:
+                errors.append(f'{model_id}: {exc}')
+        self.reload()
+        self.summary.setText(f'Cleaned up {removed} download(s).')
+        if errors:
+            QMessageBox.warning(self, 'Some downloads could not be cleaned up', '\n'.join(errors))
+
     def finished(self):
         self.worker = None
+        self.cancel_button.setEnabled(False)
+        self.cleanup_button.setEnabled(True)
         self.pause_button.setEnabled(False)
         self.resume_button.setEnabled(True)
-        self.summary.setText('Queue stopped. Completed models are available in Models; paused or failed items can be resumed.')
+        self.summary.setText('Queue stopped. Completed models are available in Models; unfinished items can be resumed or cleaned up.')
 
     def resume(self):
         selected = [item.data(0, Qt.UserRole) for item in self.tree.selectedItems() if item.text(1) != 'completed']
         if selected:
             self.resume_requested.emit(selected)
         else:
-            self.summary.setText('Select a queued, paused, interrupted, or failed model first.')
+            self.summary.setText('Select a queued, paused, interrupted, cancelled, or failed model first.')

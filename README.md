@@ -254,3 +254,7 @@ API references used for the training repair:
 and [PEFT model parameter counts](https://huggingface.co/docs/peft/package_reference/peft_model).
 
 Model cards use a readable documentation view that hides Hub YAML metadata and badge/image placeholders while preserving headings, tables, and code examples. Use **Show original model card source** to inspect the complete unmodified README.
+
+Single and batch model search results include a **Projected download size** column. The estimate sums all repository files (including alternative weight formats), matching a full model download; already cached files can reduce the actual transfer. Metadata is checked in the background without downloading model files. Unavailable size metadata is shown as **Unknown**, and the model remains selectable.
+
+On the **Downloads** tab, **Cancel downloads** stops the current transfer and cancels the remaining batch. Partial files are retained until you select entries and choose **Clean Up Selected** (with confirmation), or resume them later. Cleanup is enabled once the worker has stopped. It removes unfinished files only from app-owned download folders. For completed entries, cleanup removes download history only; installed models stay available in **Models**. Registered models, custom destinations, and linked directories are protected from partial-file cleanup.

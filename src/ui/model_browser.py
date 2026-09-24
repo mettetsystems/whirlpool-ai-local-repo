@@ -18,6 +18,8 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QListWidget,
     QListWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTextEdit,
     QPushButton,
     QLineEdit,
@@ -655,7 +657,7 @@ class DownloadModelDialog(QDialog):
         self.search_thread = None
         self.searched = False
         self.setWindowTitle("Batch Download" if batch else "Download Model")
-        self.setMinimumSize(600, 400)
+        self.setMinimumSize(800, 400)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Search Hugging Face or paste an exact model ID"))
         self.model_id_input = QLineEdit()
@@ -664,7 +666,12 @@ class DownloadModelDialog(QDialog):
         self.search_button = QPushButton("Search")
         self.search_button.clicked.connect(self._search_models)
         layout.addWidget(self.search_button)
-        self.search_results = QListWidget()
+        self.search_results = QTreeWidget()
+        self.search_results.setRootIsDecorated(False)
+        self.search_results.setHeaderLabels(['Model', 'Downloads', 'Projected download size'])
+        self.search_results.setColumnWidth(0, 380)
+        self.search_results.setColumnWidth(2, 180)
+        self.search_results.headerItem().setToolTip(2, 'Full repository file size, including all weight variants. Cached files may reduce the actual transfer. Unknown means metadata is unavailable.')
         self.search_results.itemClicked.connect(self._select_search_result)
         self.search_results.itemDoubleClicked.connect(self._select_search_result)
         self.search_results.itemChanged.connect(self._checked_changed)
@@ -710,8 +717,8 @@ class DownloadModelDialog(QDialog):
         if not self.batch:
             self.download_button.setEnabled(False)
         self.search_button.setEnabled(False)
-        self.selection_label.setText("Searching…")
-        task = TaskThread(lambda: self.hf_client.search_models(query, limit=30), self)
+        self.selection_label.setText("Searching and checking download sizes…")
+        task = TaskThread(lambda: self.hf_client.search_models(query, limit=30, include_download_size=True), self)
         self.search_thread = task
         task.succeeded.connect(self._search_ready)
         task.failed.connect(lambda error: self.selection_label.setText("Search failed: " + error))
@@ -725,12 +732,16 @@ class DownloadModelDialog(QDialog):
     def _search_ready(self, results):
         self.search_results.blockSignals(True)
         for result in results:
-            item = QListWidgetItem(f"{result['id']} — {result.get('downloads', 0)} downloads")
-            item.setData(Qt.UserRole, result)
+            from src.ui.downloads_tab import size_text
+            size = result.get('download_size_bytes')
+            size_label = size_text(size) if type(size) is int and size >= 0 else 'Unknown'
+            item = QTreeWidgetItem([result['id'], str(result.get('downloads') or 0), size_label])
+            item.setToolTip(2, f'{size:,} bytes across all repository files' if size_label != 'Unknown' else 'Size metadata unavailable; download remains selectable.')
+            item.setData(0, Qt.UserRole, result)
             if self.batch:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked if result['id'] in self.checked else Qt.Unchecked)
-            self.search_results.addItem(item)
+                item.setCheckState(0, Qt.Checked if result['id'] in self.checked else Qt.Unchecked)
+            self.search_results.addTopLevelItem(item)
         self.search_results.blockSignals(False)
         if self.batch:
             self._update_checked()
@@ -741,19 +752,19 @@ class DownloadModelDialog(QDialog):
         if not self.batch and self.search_results.currentItem():
             self._select_search_result(self.search_results.currentItem())
 
-    def _select_search_result(self, item):
+    def _select_search_result(self, item, column=0):
         if self.batch:
             return
-        result = item.data(Qt.UserRole)
+        result = item.data(0, Qt.UserRole)
         if result:
             self.model_id_input.setText(result['id'])
             self.download_button.setEnabled(True)
 
-    def _checked_changed(self, item):
+    def _checked_changed(self, item, column=0):
         if not self.batch:
             return
-        model_id = item.data(Qt.UserRole)['id']
-        if item.checkState() == Qt.Checked:
+        model_id = item.data(0, Qt.UserRole)['id']
+        if item.checkState(0) == Qt.Checked:
             self.checked[model_id] = True
         else:
             self.checked.pop(model_id, None)
@@ -772,16 +783,16 @@ class DownloadModelDialog(QDialog):
             self.selection_label.setText(str(exc))
             return
         self.checked[model_id] = True
-        for index in range(self.search_results.count()):
-            item = self.search_results.item(index)
-            if item.data(Qt.UserRole)['id'] == model_id:
-                item.setCheckState(Qt.Checked)
+        for index in range(self.search_results.topLevelItemCount()):
+            item = self.search_results.topLevelItem(index)
+            if item.data(0, Qt.UserRole)['id'] == model_id:
+                item.setCheckState(0, Qt.Checked)
         self._update_checked()
 
     def _clear_checked(self):
         self.checked.clear()
-        for index in range(self.search_results.count()):
-            self.search_results.item(index).setCheckState(Qt.Unchecked)
+        for index in range(self.search_results.topLevelItemCount()):
+            self.search_results.topLevelItem(index).setCheckState(0, Qt.Unchecked)
         self._update_checked()
 
     def done(self, result):
